@@ -1,0 +1,49 @@
+# Fire/smoke detection configuration.
+# Values here are defaults; override any of them without editing this file:
+#   * environment: FIREWATCH_RTSP_URL, FIREWATCH_MODEL_PATH, FIREWATCH_WEBHOOK_URL, ...
+#   * CLI:         firewatch run --set model__device=cuda:0 --set alert__min_confidence=0.4
+
+source:
+  source_type: rtsp            # "rtsp" for a camera, "file" for a video/image
+  rtsp_url: "rtsp://user:password@192.168.1.10:554/stream1"
+  file_path: null              # required when source_type is "file"
+  transport: tcp               # tcp is more reliable than udp on congested networks
+  read_timeout_seconds: 5.0
+  reconnect_initial_backoff: 1.0
+  reconnect_max_backoff: 30.0
+  max_reconnect_attempts: 0    # 0 = retry forever
+  width: null                  # optional downscale, e.g. 1280
+  height: null
+
+model:
+  model_path: models/best.pt
+  device: cpu                  # "cuda:0" or "mps" if available
+  imgsz: 640
+  confidence_threshold: 0.35   # detections below this are dropped
+  iou_threshold: 0.45
+  max_detections: 50
+  half_precision: false        # FP16, CUDA only
+  unknown_labels_policy: ignore # ignore | as_other
+
+alert:
+  enable_alerts: true
+  alert_on_fire: true
+  alert_on_smoke: false
+  min_confidence: 0.5          # confidence needed to raise an alert
+  consecutive_frames: 2        # sustained frames before alerting (noise suppression)
+  cooldown_seconds: 60.0       # minimum gap between repeated alerts
+  min_bbox_area_px: 0.0        # ignore tiny boxes; e.g. 400 = 20x20 px
+  webhook_url: null            # e.g. "https://hooks.example.com/firewatch"
+  webhook_timeout_seconds: 5.0
+
+logging:
+  log_dir: logs
+  detection_log: detections.jsonl
+  alert_log: alerts.jsonl
+  write_frames_with_detections: false
+  annotated_frame_dir: logs/annotated
+
+runtime:
+  process_every_n_frames: 1    # raise to 3-5 to cut CPU load on slow hardware
+  max_fps: null                # e.g. 5 to cap processing rate
+  max_frames: 0                # 0 = run until stopped
