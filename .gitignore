@@ -15,3 +15,6 @@ models/*.onnx
 
 # Secrets
 .env
+
+# Agent scratch space / temporary file transfers
+.agent_tmp/
