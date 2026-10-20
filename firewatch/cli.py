@@ -129,7 +129,48 @@ def _check(config: AppConfig) -> int:
 
     detector = FireSmokeDetector.from_config(config.model)
     logger.info("Config OK; model %s loaded via %s", model_path, type(detector).__name__)
+    _report_actuation_status(config)
     return 0
+
+
+def _report_actuation_status(config: AppConfig) -> None:
+    """Print exactly what the actuator would do, so enabling it is a choice.
+
+    Reporting the resolved actuator type and zone list here means an operator
+    can confirm a live configuration is what they intended *before* running,
+    rather than discovering it after a spray.
+    """
+    from .actuator import build_actuator
+    from .geometry import ZoneFilter
+
+    actuation = config.actuation
+    if not actuation.enable_actuation:
+        logger.info("Actuation: DISABLED (detection and alerting only)")
+        return
+
+    actuator = build_actuator(actuation)
+    zones = ZoneFilter.from_configs(actuation.zones)
+    mode = "DRY RUN (no hardware will move)" if actuation.dry_run else "LIVE (hardware)"
+    logger.warning("Actuation: ENABLED - %s", mode)
+    logger.warning("  actuator      : %s", type(actuator).__name__)
+    logger.warning("  trigger       : %s", ", ".join(actuation.trigger_classes))
+    logger.warning(
+        "  evidence      : conf>=%.2f, streak>=%d, held>=%.1fs, box>=%.0fpx",
+        actuation.min_confidence,
+        actuation.consecutive_frames,
+        actuation.arm_delay_seconds,
+        actuation.min_bbox_area_px,
+    )
+    logger.warning(
+        "  spray limits  : max %.1fs per shot, %d shot(s), %.0fs cooldown",
+        actuation.max_spray_seconds,
+        actuation.max_shots,
+        actuation.cooldown_seconds,
+    )
+    logger.warning(
+        "  zones         : %s",
+        ", ".join(zones.zone_names) if zones.has_zones else "whole frame",
+    )
 
 
 if __name__ == "__main__":

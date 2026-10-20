@@ -1,0 +1,45 @@
+# Example protected zones for actuation.
+#
+# A zone answers "where is this nozzle allowed to wet?". A fire detected
+# outside every enabled zone is still logged and alerted on, but never
+# actuates. Coordinates are NORMALISED (0.0-1.0), not pixels, so the same
+# definition keeps its meaning if you change camera resolution.
+#
+# To find the numbers you need: save an annotated frame with
+#   firewatch analyze --input frame.jpg --set logging__write_frames_with_detections=true
+# then read the pixel coordinates off that image and divide by the frame
+# width and height.
+#
+# Copy the zones you want into the `actuation.zones` list in your config.
+
+actuation:
+  require_zone: true
+  zones:
+    # A bench-top or floor area in the lower half of the frame.
+    - name: bench
+      enabled: true
+      polygon:
+        - [0.10, 0.45]   # top-left
+        - [0.90, 0.45]   # top-right
+        - [0.90, 0.95]   # bottom-right
+        - [0.10, 0.95]   # bottom-left
+
+    # A doorway, which is likely where fire enters from another room.
+    # Disabled by default: enabling it widens the area the nozzle covers.
+    - name: doorway
+      enabled: false
+      polygon:
+        - [0.40, 0.20]
+        - [0.60, 0.20]
+        - [0.60, 0.60]
+        - [0.40, 0.60]
+
+# Reasoning to apply when choosing zones:
+#
+#   * Smaller is safer. Every extra square metre is another place a false
+#     positive can reach.
+#   * Exclude anything that must not be sprayed: electrical panels, a
+#     doorway you use to escape, the area where someone stands to operate
+#     the system.
+#   * If you cannot draw a zone that excludes those things, the camera is
+#     in the wrong place - move the camera rather than enlarging the zone.

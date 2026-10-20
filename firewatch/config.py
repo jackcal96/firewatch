@@ -112,12 +112,138 @@ class AlertConfig(StrictModel):
     webhook_timeout_seconds: float = Field(default=5.0, gt=0)
 
 
+class ZoneConfig(StrictModel):
+    """A protected area that a detection must fall inside to count.
+
+    ``polygon`` is a list of ``[x, y]`` points in normalised coordinates
+    (0.0-1.0), so the same zone survives a resolution change on the camera.
+    """
+
+    name: str = Field(min_length=1)
+    polygon: list[tuple[float, float]] = Field(
+        min_length=3, description="At least three [x, y] points, normalised 0-1."
+    )
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _points_in_range(self) -> "ZoneConfig":
+        for x, y in self.polygon:
+            if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                raise ValueError(
+                    f"zone '{self.name}' has a point outside 0-1: ({x}, {y}). "
+                    "Coordinates are normalised, not pixels."
+                )
+        return self
+
+
+class ActuationConfig(StrictModel):
+    """When, and whether, to physically actuate a suppression device.
+
+    This is the highest-risk configuration in the project, so every default is
+    the conservative one: actuation is off, and even when switched on it runs
+    in dry-run until an operator explicitly disables that.
+
+    The valve opens only when *all* of these hold:
+        * ``enable_actuation`` is true and the device is not locked out
+        * a qualifying detection has persisted for ``consecutive_frames``
+        * confidence is at or above ``min_confidence``
+        * the box is large enough (``min_bbox_area_px``) and, when
+          ``require_zone`` is set, sits inside a configured zone
+        * the evidence has held for ``arm_delay_seconds`` with the heartbeat
+          fresh, so a stale detector cannot command a spray
+        * the shot budget (``max_shots``) is not exhausted
+    """
+
+    enable_actuation: bool = Field(
+        default=False, description="Master switch. Off means never actuate."
+    )
+    dry_run: bool = Field(
+        default=True,
+        description="Simulate everything, touch no hardware. Disable only after "
+        "weeks of clean dry-run logs.",
+    )
+    trigger_classes: list[Literal["fire", "smoke"]] = Field(
+        default=["fire"],
+        description="Classes allowed to actuate. Smoke alone should never open a "
+        "valve; it is too weak a signal.",
+    )
+    min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    consecutive_frames: int = Field(default=5, ge=1)
+    min_bbox_area_px: float = Field(default=400.0, ge=0.0)
+    arm_delay_seconds: float = Field(
+        default=2.0, ge=0.0, description="Evidence must hold this long before spraying."
+    )
+    min_spray_seconds: float = Field(
+        default=1.0, ge=0.0, description="Avoids rapid valve cycling."
+    )
+    max_spray_seconds: float = Field(
+        default=10.0, gt=0, description="Hard ceiling on a single spray."
+    )
+    cooldown_seconds: float = Field(default=300.0, ge=0.0)
+    max_shots: int = Field(
+        default=1, ge=1, description="Shots before the device locks out for a human."
+    )
+    watchdog_timeout_seconds: float = Field(
+        default=3.0, gt=0, description="Max heartbeat age tolerated before a spray."
+    )
+    stop_on_evidence_loss: bool = Field(
+        default=True, description="Close the valve once fire is no longer visible."
+    )
+    require_zone: bool = Field(
+        default=True, description="Require detections to fall inside a protected zone."
+    )
+    zones: list[ZoneConfig] = Field(default_factory=list)
+    open_command: list[str] | None = Field(
+        default=None, description="argv of the command that opens the valve."
+    )
+    close_command: list[str] | None = Field(
+        default=None, description="argv of the command that closes the valve."
+    )
+    command_timeout_seconds: float = Field(default=5.0, gt=0)
+
+    @model_validator(mode="after")
+    def _check_safety_invariants(self) -> "ActuationConfig":
+        if not self.enable_actuation:
+            return self
+
+        if self.require_zone and not any(z.enabled for z in self.zones):
+            raise ValueError(
+                "require_zone is set but no enabled zones are configured. Add a "
+                "zone, or set require_zone: false to accept the whole frame."
+            )
+        if self.min_confidence < 0.5:
+            raise ValueError(
+                f"min_confidence={self.min_confidence} is too low to actuate on. "
+                "Require at least 0.5."
+            )
+        if self.consecutive_frames < 2:
+            raise ValueError(
+                "consecutive_frames must be at least 2 for actuation; a single "
+                "frame is not evidence."
+            )
+        if self.max_spray_seconds < self.min_spray_seconds:
+            raise ValueError("max_spray_seconds must be >= min_spray_seconds")
+        if "smoke" in self.trigger_classes and "fire" not in self.trigger_classes:
+            raise ValueError(
+                "trigger_classes must include 'fire'. Actuating on smoke alone is "
+                "not a supported configuration."
+            )
+        if not self.dry_run:
+            if not self.open_command or not self.close_command:
+                raise ValueError(
+                    "dry_run is false but open_command/close_command are unset. "
+                    "Refusing to start a live actuator with no way to close it."
+                )
+        return self
+
+
 class LoggingConfig(StrictModel):
-    """Where detections and alerts are persisted."""
+    """Where detections, alerts and actuation events are persisted."""
 
     log_dir: str = "logs"
     detection_log: str = "detections.jsonl"
     alert_log: str = "alerts.jsonl"
+    actuation_log: str = "actuation.jsonl"
     write_frames_with_detections: bool = False
     annotated_frame_dir: str = "logs/annotated"
 
@@ -138,6 +264,7 @@ class AppConfig(StrictModel):
     source: SourceConfig = Field(default_factory=SourceConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     alert: AlertConfig = Field(default_factory=AlertConfig)
+    actuation: ActuationConfig = Field(default_factory=ActuationConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
 

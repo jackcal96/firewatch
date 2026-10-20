@@ -49,6 +49,27 @@ detection + OpenCV capture + JSONL logging + webhook alerts. Pure Python.
 * `tests/conftest.py` defines `FakeBackend` (replays scripted results, then
   repeats the last one), `make_raw`, `RecordingNotifier`, `ExplodingNotifier`.
 
+## Actuation safety invariants (do not weaken)
+
+`supervisor.py` is the only module that can command hardware. These rules are
+load-bearing; changing them changes the safety argument:
+
+* Actuation defaults to **off**, and `dry_run` defaults to **true**. A config
+  must never reach a live actuator without an explicit human decision.
+* `ActuationConfig._check_safety_invariants` refuses unsafe combinations at
+  construction: `min_confidence` < 0.5, `consecutive_frames` < 2, smoke-only
+  `trigger_classes`, `require_zone` with no zones, and `dry_run: false` with no
+  `close_command`. Add gates here rather than removing them.
+* `LOCKED_OUT` is terminal until `reset()` is called explicitly. Never
+  auto-reset: that is how one false positive spends the whole shot budget.
+* `max_shots` defaults to 1. Spraying is not idempotent and cannot be undone.
+* The watchdog must close the valve when the detector stops heartbeating. A
+  dead detector holding a valve open is the worst failure in the system.
+* `tick()` exists so timers fire without new frames. If you change the spray
+  timer path, keep `tick()` working — a stalled stream must still close a valve.
+* Decisions carry a `reason` from `DenyReason`. Every refusal should stay
+  explainable from the audit log alone.
+
 ## Runtime facts verified locally
 
 * Real RTSP was tested end-to-end with a local `mediamtx` server plus an ffmpeg

@@ -9,7 +9,8 @@ import cv2
 
 from .config import AppConfig
 from .detector import FireSmokeDetector
-from .pipeline import FireSmokePipeline
+from .logging_utils import DetectionLogger
+from .pipeline import FireSmokePipeline, build_supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +20,9 @@ _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 def analyze_file(config: AppConfig, input_path: str) -> int:
     """Run the pipeline over a local image or video file.
 
-    Useful for validating a model or config change without a camera. Returns a
-    process exit code: 0 on success, 2 if the file could not be read.
+    Useful for validating a model or config change without a camera, and for
+    rehearsing the actuation decision logic in dry-run against real footage.
+    Returns a process exit code: 0 on success, 2 if the file could not be read.
     """
     path = Path(input_path)
     if not path.is_file():
@@ -28,7 +30,11 @@ def analyze_file(config: AppConfig, input_path: str) -> int:
         return 2
 
     detector = FireSmokeDetector.from_config(config.model)
-    pipeline = FireSmokePipeline(config, detector)
+    detection_logger = DetectionLogger(config.logging)
+    supervisor = build_supervisor(config, detection_logger)
+    pipeline = FireSmokePipeline(
+        config, detector, detection_logger=detection_logger, supervisor=supervisor
+    )
 
     if path.suffix.lower() in _IMAGE_SUFFIXES:
         frame = cv2.imread(str(path))

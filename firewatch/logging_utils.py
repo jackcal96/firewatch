@@ -54,6 +54,7 @@ class DetectionLogger:
         log_dir = Path(config.log_dir)
         self._detections = JsonlWriter(log_dir / config.detection_log)
         self._alerts = JsonlWriter(log_dir / config.alert_log)
+        self._actuation = JsonlWriter(log_dir / config.actuation_log)
 
     def log_frame(self, result: Any) -> None:
         """Persist a frame result, skipping frames with no detections."""
@@ -63,6 +64,14 @@ class DetectionLogger:
 
     def log_alert(self, alert: Any) -> None:
         self._alerts.write(alert.to_dict())
+
+    def log_actuation(self, record: Any) -> None:
+        """Persist an actuation decision or actuator event.
+
+        Every command that can open a valve is recorded here, whether or not it
+        succeeded. This file is the audit trail for "why did it spray?".
+        """
+        self._actuation.write(record.to_dict() if hasattr(record, "to_dict") else record)
 
     def log_event(self, event: str, **fields: Any) -> None:
         record = {
@@ -75,6 +84,7 @@ class DetectionLogger:
     def close(self) -> None:
         self._detections.close()
         self._alerts.close()
+        self._actuation.close()
 
     def __enter__(self) -> "DetectionLogger":
         return self

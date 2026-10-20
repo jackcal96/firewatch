@@ -19,6 +19,7 @@ import numpy as np
 import cv2
 
 from .alerts import AlertPolicy, build_notifiers
+from .supervisor import ActuationSupervisor
 from .config import AppConfig
 from .detector import FireSmokeDetector
 from .logging_utils import DetectionLogger
@@ -38,6 +39,7 @@ class FireSmokePipeline:
         detector: FireSmokeDetector,
         alert_policy: AlertPolicy | None = None,
         detection_logger: DetectionLogger | None = None,
+        supervisor: ActuationSupervisor | None = None,
     ) -> None:
         self._config = config
         self._detector = detector
@@ -46,6 +48,7 @@ class FireSmokePipeline:
             config.alert, notifiers=build_notifiers(config.alert)
         )
         self._owns_logger = detection_logger is None
+        self._supervisor = supervisor
         self.frames_processed = 0
         self.alerts_raised = 0
 
@@ -66,6 +69,12 @@ class FireSmokePipeline:
         for alert in self._alert_policy.evaluate(result):
             self.alerts_raised += 1
             self._logger.log_alert(alert)
+
+        if self._supervisor is not None:
+            height, width = frame.shape[:2]
+            decision = self._supervisor.observe(result, frame_size=(width, height))
+            if decision.action != "none":
+                self._logger.log_actuation(decision)
 
         self.frames_processed += 1
 
@@ -122,11 +131,49 @@ class FireSmokePipeline:
             self._logger.close()
 
 
+def build_supervisor(
+    config: AppConfig, detection_logger: DetectionLogger | None = None
+) -> ActuationSupervisor | None:
+    """Assemble an actuation supervisor, or None when actuation is disabled.
+
+    Returns None when ``enable_actuation`` is false so the detection-only path
+    carries no actuation code at all - there is no valve to accidentally open.
+    """
+    if not config.actuation.enable_actuation:
+        return None
+
+    # Decisions are logged by the pipeline (which sees every frame); the
+    # supervisor reports actuator commands directly, since those are the events
+    # a human most needs to audit.
+    on_event = detection_logger.log_actuation if detection_logger is not None else None
+    supervisor = ActuationSupervisor(
+        config.actuation,
+        on_actuator_event=on_event,
+    )
+
+    mode = "DRY RUN" if config.actuation.dry_run else "LIVE"
+    summary = (
+        f"Actuation ENABLED ({mode}): min_conf={config.actuation.min_confidence}, "
+        f"streak={config.actuation.consecutive_frames}, "
+        f"max_spray={config.actuation.max_spray_seconds}s, "
+        f"max_shots={config.actuation.max_shots}, "
+        f"zones={supervisor.zone_names or 'whole frame'}"
+    )
+    if config.actuation.dry_run:
+        logger.warning(summary)
+    else:
+        logger.warning("%s", summary)
+        logger.warning("LIVE ACTUATION: this process can now command physical hardware")
+    return supervisor
+
+
 def run_forever(config: AppConfig) -> int:
     """Production entry point: capture from the configured source until Ctrl-C."""
     source = RtspFrameSource(config.source)
     detector = FireSmokeDetector.from_config(config.model)
-    pipeline = FireSmokePipeline(config, detector)
+    actuation_logger = DetectionLogger(config.logging)
+    supervisor = build_supervisor(config, actuation_logger)
+    pipeline = FireSmokePipeline(config, detector, detection_logger=actuation_logger, supervisor=supervisor)
 
     stop_event = Event()
 

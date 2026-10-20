@@ -36,10 +36,37 @@ alert:
   webhook_url: null            # e.g. "https://hooks.example.com/firewatch"
   webhook_timeout_seconds: 5.0
 
+# ---------------------------------------------------------------------------
+# Actuation: physically driving a suppression device.
+#
+# Disabled by default, and even when enabled it runs in dry-run until you
+# explicitly turn that off. Read firewatch/supervisor.py before enabling.
+# ---------------------------------------------------------------------------
+actuation:
+  enable_actuation: false      # master switch; false = detect only, never actuate
+  dry_run: true                # simulate everything, touch no hardware
+  trigger_classes: [fire]      # smoke alone must never open a valve
+  min_confidence: 0.6          # evidence confidence needed to spray
+  consecutive_frames: 5        # sustained frames before spraying
+  min_bbox_area_px: 400        # ignore small boxes (20x20 px)
+  arm_delay_seconds: 2.0       # evidence must hold this long before spraying
+  min_spray_seconds: 1.0       # avoid rapid valve cycling
+  max_spray_seconds: 10.0      # hard ceiling on a single spray
+  cooldown_seconds: 300.0      # minimum gap between sprays
+  max_shots: 1                 # shots before lockout; a human must reset
+  watchdog_timeout_seconds: 3.0 # stale heartbeat forces the valve closed
+  stop_on_evidence_loss: true  # close once fire is no longer visible
+  require_zone: true           # only spray inside a configured protected zone
+  zones: []                    # see configs/zones.example.yaml
+  open_command: null           # e.g. ["python", "scripts/valve.py", "open"]
+  close_command: null          # e.g. ["python", "scripts/valve.py", "close"]
+  command_timeout_seconds: 5.0
+
 logging:
   log_dir: logs
   detection_log: detections.jsonl
   alert_log: alerts.jsonl
+  actuation_log: actuation.jsonl
   write_frames_with_detections: false
   annotated_frame_dir: logs/annotated
 

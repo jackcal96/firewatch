@@ -187,6 +187,126 @@ your own loop, or run the detection log through `jq`:
 jq -c 'select(.max_fire_confidence > 0.5)' logs/detections.jsonl
 ```
 
+## Actuation (driving a suppression device)
+
+> **Read this before enabling anything.** Actuation is the part of this project
+> that can cause physical harm. The default configuration cannot actuate: it
+> detects, alerts and logs, and nothing else.
+
+Detection is not a decision. The model answers "is there fire in this frame?",
+which is a different question from "should I open a valve?". `firewatch`
+separates the two: the model produces observations, and
+`firewatch/supervisor.py` decides whether those observations justify acting.
+
+### The safety model
+
+Actuation is off by default and requires several deliberate steps to enable.
+When enabled, the valve opens only if **all** of these hold:
+
+| Gate | Default | Purpose |
+| --- | --- | --- |
+| `enable_actuation` | `false` | Master switch. Off means nothing can move. |
+| `dry_run` | `true` | Simulates commands; no hardware is touched. |
+| `trigger_classes` | `[fire]` | Smoke alone can never open a valve. |
+| `min_confidence` | `0.6` | Weak evidence does not actuate. Floor is 0.5. |
+| `consecutive_frames` | `5` | Sustained evidence, not a single frame. Minimum 2. |
+| `min_bbox_area_px` | `400` | Ignores small boxes, which are usually noise. |
+| `arm_delay_seconds` | `2.0` | Evidence must hold this long in wall-clock time. |
+| `require_zone` | `true` | Fire must be inside a configured protected zone. |
+| `max_spray_seconds` | `10.0` | Hard ceiling on any single spray. |
+| `max_shots` | `1` | Budget, after which the device locks out. |
+| `watchdog_timeout_seconds` | `3.0` | A dead detector forces the valve closed. |
+
+Every one of these is validated at startup. An unsafe combination — a
+confidence below 0.5, a single-frame trigger, smoke-only triggering, a live
+mode with no close command — is refused rather than silently accepted.
+
+The state machine is `IDLE → CONFIRMING → SPRAYING → COOLDOWN → LOCKED_OUT`.
+`LOCKED_OUT` is terminal until a human calls `reset()`: an automatic reset
+would let the device spend its whole shot budget on one persistent false
+positive. A closed valve is the resting state, so power loss or a crash fails
+closed.
+
+### Trying it safely
+
+Run the whole decision path against a video, with no hardware anywhere:
+
+```bash
+firewatch analyze --input your_clip.mp4 \
+  --set actuation__enable_actuation=true \
+  --set actuation__require_zone=false \
+  --set actuation__consecutive_frames=2 \
+  --set actuation__arm_delay_seconds=0.0
+```
+
+This is a genuine rehearsal: the supervisor runs its real logic and writes to
+`logs/actuation.jsonl`, but `DryRunActuator` performs no I/O. You will see
+lines like:
+
+```
+DRY RUN: valve OPEN commanded (no hardware attached)
+DRY RUN: valve CLOSE commanded (no hardware attached)
+```
+
+and an audit record for each decision explaining *why*:
+
+```json
+{"event": "actuation_decision", "action": "open", "allowed": true,
+ "reason": "fire_confirmed", "state": "spraying", "confidence": 0.5092,
+ "shots_used": 1, "detail": "spraying; shot 1/1 (DRY RUN - no water)"}
+```
+
+Confirm what a config would do before running it:
+
+```bash
+firewatch check --config your_config.yaml
+```
+
+### Zones
+
+A zone is the area a nozzle is allowed to wet. Detections outside every enabled
+zone are still logged and alerted on, but never actuate. Coordinates are
+normalised (0.0-1.0), so a zone definition survives a resolution change.
+
+See `configs/zones.example.yaml` for a worked example. To derive coordinates,
+save an annotated frame and read the pixel positions off it:
+
+```bash
+firewatch analyze --input frame.jpg \
+  --set logging__write_frames_with_detections=true
+# annotated image lands in logs/annotated/
+```
+
+### Connecting real hardware
+
+`open_command` and `close_command` are argv lists, run without a shell, so this
+project does not care how your device is driven — GPIO, a relay board, MQTT, a
+serial port. Provide a small script and point the config at it:
+
+```yaml
+actuation:
+  enable_actuation: true
+  dry_run: false
+  require_zone: true
+  zones: [...]                      # must not be empty
+  open_command: ["python", "scripts/valve.py", "open"]
+  close_command: ["python", "scripts/valve.py", "close"]
+```
+
+Turning off `dry_run` is the last step, not the first. Run in dry-run for weeks
+and read `logs/actuation.jsonl` first: if there is a single entry there that you
+would not have wanted to become real water, the answer is not to tune the
+thresholds, it is to keep it in dry-run.
+
+### What this does not do
+
+* It does not choose, size, aim or plumb the hardware.
+* It does not detect fire *spread*, only where fire was seen in a frame.
+* It has no independent sensor. One model's opinion is the only evidence, which
+  is why the constraints are conservative and `max_shots` defaults to 1.
+* It is not a substitute for a certified suppression system. A fire alarm and
+  an extinguisher remain the primary controls.
+
 ## Tests
 
 ```bash
@@ -210,14 +330,24 @@ firewatch/
   detector.py        # Ultralytics backend + threshold/label filtering
   stream.py          # RTSP/file capture with reconnect and backoff
   alerts.py          # alert policy (streak, cooldown) and notifiers
-  logging_utils.py   # JSONL detection/alert/event writers
+  geometry.py        # protected zones: point-in-polygon and bbox coverage
+  actuator.py        # hardware boundary: dry-run and subprocess actuators
+  supervisor.py      # actuation state machine and safety interlocks
+  logging_utils.py   # JSONL detection/alert/actuation writers
   visualize.py       # annotated frame rendering
   pipeline.py        # orchestration; run_forever() entry point
   cli.py             # argparse CLI (run / analyze / check)
 tests/               # pytest suite; fakes live in conftest.py
-configs/default.yaml # default configuration
+configs/default.yaml       # default configuration
+configs/zones.example.yaml # worked example of protected zones
 scripts/download_model.py
 ```
+
+The detection path and the actuation path are deliberately separate modules.
+`detector.py` never knows a valve exists, and `supervisor.py` never knows how a
+frame was produced. That boundary is what lets the safety logic be tested with
+no camera and no hardware, and it keeps the code that can move water small
+enough to review in full.
 
 ## Performance
 
@@ -238,9 +368,13 @@ to reduce load:
   bright orange industrial lighting can produce false positives. Validate on your
   own footage before relying on it.
 * Smoke detection is weaker than fire detection. It is disabled for alerting by
-  default for that reason.
+  default for that reason, and it can never trigger actuation.
 * This is a monitoring aid, not a certified fire alarm. It does not replace
   hard-wired smoke detectors or a monitored alarm system.
+* Actuation relies on a single model as its only evidence. There is no
+  independent thermal or gas sensor, so the system cannot cross-check what it
+  thinks it sees. Keep `max_shots` at 1 and stay in dry-run until the audit log
+  shows a long, clean record.
 
 ## Licence
 
