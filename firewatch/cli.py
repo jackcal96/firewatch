@@ -72,6 +72,29 @@ def _build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check", help="Validate config and load the model.")
     add_common(check)
 
+    home = sub.add_parser(
+        "home",
+        help="Home the turret and report the datum it established.",
+    )
+    add_common(home)
+
+    calibrate = sub.add_parser(
+        "calibrate",
+        help="Build the pixel-to-bearing mapping for the turret.",
+    )
+    add_common(calibrate)
+    calibrate.add_argument(
+        "--points",
+        default="configs/turret_calibration.json",
+        help="Where to write the calibration.",
+    )
+
+    turret_status = sub.add_parser(
+        "turret",
+        help="Show turret configuration, envelope and calibration status.",
+    )
+    add_common(turret_status)
+
     return parser
 
 
@@ -106,6 +129,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check":
             return _check(_load_config(args))
 
+        if args.command == "home":
+            return _home(_load_config(args))
+
+        if args.command == "calibrate":
+            from .cli_helpers import calibrate_turret
+
+            return calibrate_turret(_load_config(args), args.points)
+
+        if args.command == "turret":
+            return _turret_status(_load_config(args))
+
     except (FileNotFoundError, ValueError) as exc:
         logger.error("%s", exc)
         return 2
@@ -130,6 +164,107 @@ def _check(config: AppConfig) -> int:
     detector = FireSmokeDetector.from_config(config.model)
     logger.info("Config OK; model %s loaded via %s", model_path, type(detector).__name__)
     _report_actuation_status(config)
+    _report_turret_status(config)
+    return 0
+
+
+def _home(config: AppConfig) -> int:
+    """Home the turret, establishing the datum all bearings are measured from."""
+    from .aim_controller import build_aim_controller
+    from .aiming import CalibrationError
+
+    if not config.turret.enable_turret:
+        logger.error("Turret is disabled; set turret.enable_turret: true first.")
+        return 2
+
+    try:
+        controller = build_aim_controller(config)
+    except CalibrationError as exc:
+        # Homing does not need a calibration - it only needs the mount - so a
+        # missing calibration is not fatal here. Report it and carry on.
+        logger.warning("%s", exc)
+        controller = None
+
+    from .turret import build_turret
+
+    turret = controller.turret if controller is not None else build_turret(config.turret)
+    if turret is None:
+        logger.error("Could not build a turret from this config.")
+        return 2
+
+    try:
+        event = turret.home()
+    except Exception as exc:  # noqa: BLE001 - report, never crash the operator
+        logger.error("Homing failed: %s", exc)
+        turret.close()
+        return 2
+    finally:
+        if controller is not None:
+            controller.close()
+
+    logger.info(
+        "Turret homed at pan=%.2f tilt=%.2f (%s)",
+        event.pan or 0.0,
+        event.tilt or 0.0,
+        "simulated" if event.simulated else "live",
+    )
+    logger.info(
+        "Travel envelope: pan [%.1f, %.1f], tilt [%.1f, %.1f]",
+        config.turret.min_pan,
+        config.turret.max_pan,
+        config.turret.min_tilt,
+        config.turret.max_tilt,
+    )
+    return 0
+
+
+def _turret_status(config: AppConfig) -> int:
+    """Report the aiming configuration without moving anything."""
+    from .aiming import Calibration, CalibrationError
+
+    turret = config.turret
+    if not turret.enable_turret:
+        logger.info("Turret: DISABLED (fixed nozzle, no aiming)")
+        return 0
+
+    mode = "DRY RUN (no motion)" if turret.dry_run else "LIVE (hardware will move)"
+    logger.warning("Turret: ENABLED - %s", mode)
+    logger.warning("  port          : %s", turret.serial_port or "(none)")
+    logger.warning(
+        "  envelope      : pan [%.1f, %.1f], tilt [%.1f, %.1f]",
+        turret.min_pan,
+        turret.max_pan,
+        turret.min_tilt,
+        turret.max_tilt,
+    )
+    logger.warning(
+        "  home datum    : pan=%.1f tilt=%.1f", turret.home_pan, turret.home_tilt
+    )
+    logger.warning("  aim tolerance : %.1f deg", turret.aim_tolerance_degrees)
+    logger.warning("  settle        : %.2f s", turret.settle_seconds)
+
+    try:
+        calibration = Calibration.load(turret.calibration_path)
+    except CalibrationError as exc:
+        logger.warning("  calibration   : MISSING - %s", exc)
+        return 0
+
+    logger.warning("  calibration   : %s", turret.calibration_path)
+    logger.warning(
+        "    pan  = %.4f * u + %.4f",
+        calibration.pan_axis.scale,
+        calibration.pan_axis.offset,
+    )
+    logger.warning(
+        "    tilt = %.4f * v + %.4f",
+        calibration.tilt_axis.scale,
+        calibration.tilt_axis.offset,
+    )
+    if calibration.is_degenerate:
+        logger.warning(
+            "    WARNING: degenerate axis - every target maps to one angle. "
+            "Re-run 'firewatch calibrate'."
+        )
     return 0
 
 
@@ -171,6 +306,35 @@ def _report_actuation_status(config: AppConfig) -> None:
         "  zones         : %s",
         ", ".join(zones.zone_names) if zones.has_zones else "whole frame",
     )
+
+
+def _report_turret_status(config: AppConfig) -> None:
+    """Report the aiming setup, including whether the spray gate is active."""
+    turret = config.turret
+    if not turret.enable_turret:
+        logger.info("Turret: DISABLED (fixed nozzle, no aiming)")
+        return
+
+    mode = "DRY RUN (no motion)" if turret.dry_run else "LIVE (hardware)"
+    logger.warning("Turret: ENABLED - %s", mode)
+    logger.warning("  port          : %s", turret.serial_port or "(none)")
+    logger.warning(
+        "  envelope      : pan [%.1f, %.1f], tilt [%.1f, %.1f]",
+        turret.min_pan,
+        turret.max_pan,
+        turret.min_tilt,
+        turret.max_tilt,
+    )
+    logger.warning("  aim tolerance : %.1f deg", turret.aim_tolerance_degrees)
+
+    if config.actuation.enable_actuation:
+        logger.warning(
+            "  spray gate    : ACTIVE - the valve will not open unless the "
+            "turret reports a bearing within %.1f deg of the target",
+            turret.aim_tolerance_degrees,
+        )
+    else:
+        logger.warning("  spray gate    : inactive (actuation is disabled)")
 
 
 if __name__ == "__main__":

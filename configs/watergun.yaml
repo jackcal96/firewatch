@@ -1,0 +1,121 @@
+# Example config for the turret ("water gun") rig.
+#
+# This file is a starting point for bench trials, not a deployment. It is
+# deliberately still dry-run: the turret will not move and the valve will not
+# open until you change that on purpose, having read logs/actuation.jsonl.
+#
+#   firewatch check  --config configs/watergun.yaml
+#   firewatch turret --config configs/watergun.yaml
+#   firewatch run    --config configs/watergun.yaml
+#
+# Order of bring-up, and it matters:
+#   1. dry_run everywhere, no water connected - watch aiming on screen
+#   2. turret live, dry_run actuation - watch it track, still no water
+#   3. both live, pump disconnected from the nozzle - verify relay timing
+#   4. both live, water connected - short bursts, someone present
+
+source:
+  source_type: rtsp
+  rtsp_url: "rtsp://user:password@192.168.1.10:554/stream1"
+  transport: tcp
+
+model:
+  model_path: models/best.pt
+  device: cpu          # set to cuda:0 or 0 for a GPU box
+  imgsz: 640
+  confidence_threshold: 0.35
+
+alert:
+  enable_alerts: true
+  alert_on_fire: true
+  alert_on_smoke: false
+  min_confidence: 0.5
+  consecutive_frames: 2
+
+# ---------------------------------------------------------------- aiming
+turret:
+  enable_turret: true
+  dry_run: true                 # keep true until aiming is verified on screen
+
+  serial_port: /dev/ttyUSB0     # Windows: COM3. Ignored while dry_run is true.
+  baud_rate: 115200
+  startup_delay_seconds: 2.0
+
+  # Travel envelope. Must be narrower than the mechanism's real range, and
+  # must match MIN/MAX in firmware/esp32_turret/esp32_turret.ino.
+  # Ceiling-mounted, looking down at a bench: tilt stays small.
+  min_pan: -60.0
+  max_pan: 60.0
+  min_tilt: -10.0
+  max_tilt: 45.0
+
+  home_pan: 0.0
+  home_tilt: 0.0
+
+  # The spray interlock. The valve will not open unless the turret reports a
+  # bearing within this many degrees of the aim target. For a pan fire at 3 m
+  # a 1 deg error is ~5 cm of miss, which a cone nozzle absorbs; tighten this
+  # as the mechanics improve, and expect denials when it is too tight.
+  aim_tolerance_degrees: 5.0
+  settle_seconds: 0.4
+
+  calibration_path: configs/turret_calibration.json
+
+# ------------------------------------------------------------- spraying
+actuation:
+  enable_actuation: true
+  dry_run: true                 # keep true until aiming is proven
+
+  trigger_classes: [fire]       # smoke alone must never open a valve
+  min_confidence: 0.6
+  consecutive_frames: 5
+  min_bbox_area_px: 400
+  arm_delay_seconds: 2.0
+
+  # A candle or pan fire goes out quickly, so the first trials want a short
+  # burst rather than a long soak. Raise max_spray_seconds only after you have
+  # watched a short one work.
+  min_spray_seconds: 1.0
+  max_spray_seconds: 5.0
+  cooldown_seconds: 300.0
+  max_shots: 1                  # one shot, then a human must reset
+
+  watchdog_timeout_seconds: 3.0
+  stop_on_evidence_loss: true
+
+  # Zones still apply. The nozzle may point anywhere inside the envelope, but
+  # water only flows when the fire is inside a zone you declared.
+  require_zone: true
+  zones:
+    - name: bench
+      # Normalised 0-1 coordinates, clockwise from the top-left of the frame.
+      polygon:
+        - [0.15, 0.25]
+        - [0.85, 0.25]
+        - [0.85, 0.85]
+        - [0.15, 0.85]
+
+  # These are unused while dry_run is true. Point them at a script that drives
+  # your pump and solenoid relay.
+  open_command: ["python", "scripts/valve.py", "open"]
+  close_command: ["python", "scripts/valve.py", "close"]
+  command_timeout_seconds: 5.0
+
+logging:
+  log_dir: logs
+  detection_log: detections.jsonl
+  alert_log: alerts.jsonl
+  actuation_log: actuation.jsonl
+  write_frames_with_detections: false
+  annotated_frame_dir: logs/annotated
+
+runtime:
+  process_every_n_frames: 1
+  max_fps: 10                   # CPU inference is slow; cap it explicitly
+  max_frames: 0
+
+  # Live preview. Needs a GUI build of OpenCV (opencv-python, not
+  # opencv-python-headless) and a display. Press q or Esc in the window to
+  # stop the run cleanly.
+  show_window: true
+  window_title: firewatch turret

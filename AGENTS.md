@@ -4,8 +4,11 @@ Repository guidance for AI agents working on **firewatch**.
 
 ## What this is
 
-Fire/smoke detection from RTSP camera feeds. YOLOv8 (Ultralytics) object
-detection + OpenCV capture + JSONL logging + webhook alerts. Pure Python.
+Fire/smoke detection from RTSP camera feeds, with optional turret aiming and
+gated water suppression. YOLOv8 (Ultralytics) object detection + OpenCV capture
++ JSONL logging + webhook alerts. Pure Python, plus an ESP32 Arduino sketch for
+the turret. The agent is strictly software: it never specifies or validates the
+physical plumbing.
 
 ## Environment
 
@@ -24,7 +27,12 @@ detection + OpenCV capture + JSONL logging + webhook alerts. Pure Python.
 .venv/bin/python -m pytest                  # includes real-model integration tests
 .venv/bin/python -m firewatch check --config configs/default.yaml
 .venv/bin/python -m firewatch analyze --input some.jpg
+.venv/bin/python -m firewatch turret --config configs/watergun.yaml
 ```
+
+`pyserial` is **not** installed in the dev venv, so `SerialTurret` is imported
+lazily and only the dry-run turret is exercised here. `tests/test_turret.py`
+installs a fake into `sys.modules["serial"]` to test the wire protocol.
 
 ## Architecture notes
 
@@ -41,6 +49,10 @@ detection + OpenCV capture + JSONL logging + webhook alerts. Pure Python.
   an ongoing outage; without it a reconnect that succeeds first try is uncounted.
 * Confidences pass through `float32`, so tests comparing exact values must use
   `pytest.approx`.
+* `AimGate` (supervisor.py) is the protocol that lets the supervisor gate a
+  spray on aim without importing any turret code. `AimController` implements
+  it. Keep that direction of dependency: `turret.py` and `aiming.py` must not
+  import `supervisor.py` beyond the shared `AimOutcome`/`DenyReason` types.
 
 ## Testing conventions
 
@@ -69,6 +81,44 @@ load-bearing; changing them changes the safety argument:
   timer path, keep `tick()` working — a stalled stream must still close a valve.
 * Decisions carry a `reason` from `DenyReason`. Every refusal should stay
   explainable from the audit log alone.
+
+## Aiming safety invariants (do not weaken)
+
+A turret breaks an assumption that made a fixed nozzle safe: with a fixed
+nozzle, fire being in the right place meant the water was too. Once the mount
+can move, that is no longer true, so the achieved bearing must be *verified*
+rather than assumed.
+
+* **Aiming and spraying are separate.** `pipeline._track()` aims at the
+  strongest fire every frame; the supervisor independently re-checks the
+  achieved bearing as its final gate. Tracking must never imply permission to
+  spray. Do not move the aim check earlier, and do not let aiming command the
+  actuator.
+* The aim gate runs **last** in `_advance`, immediately before
+  `_start_spraying`. Everything above it proves the fire is real; the gate
+  proves the nozzle is on it.
+* `AimController` treats the turret's **reported** position as the only
+  evidence. A mount that did not arrive, reports nothing, or raises must fail
+  closed. Never trust "the command was sent" as proof of aim.
+* `solve_bearing` returns `None` outside the envelope rather than clamping.
+  Clamping would report success while pointing somewhere unasked.
+* The envelope is enforced in Python **and** in the firmware. Do not remove
+  either; a serial glitch must not be able to drive the mount past its limits.
+* `TurretConfig` refuses a live turret with no `serial_port`, and a home datum
+  outside the envelope. Add gates here rather than removing them.
+* `AimController` re-checks `calibration.is_degenerate` even though
+  `build_aim_controller` already does. A zero scale maps every target to one
+  bearing, so a "successful" aim would be meaningless.
+
+## Live preview gotcha
+
+`cv2.imshow` on a machine with no display **aborts the process** — it does not
+raise a catchable `cv2.error`. So `LiveView` checks `display_available()`
+*before* calling it; catching the exception is not sufficient and the
+pre-flight check is what actually prevents the crash. Any new display code
+needs the same pre-flight. Note this dev container has both
+`opencv-python` and `opencv-python-headless` installed, with the GUI build
+winning, so a missing `DISPLAY` is the real blocker here.
 
 ## Runtime facts verified locally
 

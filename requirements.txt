@@ -13,3 +13,9 @@ huggingface_hub>=0.23
 # Development / testing
 pytest>=8.0
 pytest-cov>=5.0
+
+# Turret and live preview are optional extras:
+#   pip install pyserial            # to drive a real turret over serial
+#   pip install opencv-python       # for the live preview window (GUI build)
+# The dry-run turret, the whole test suite and detection-only operation need
+# neither.

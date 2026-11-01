@@ -237,6 +237,96 @@ class ActuationConfig(StrictModel):
         return self
 
 
+class TurretConfig(StrictModel):
+    """Aiming hardware: a two-axis mount that points the nozzle.
+
+    Aiming is separated from spraying on purpose. The turret may track a fire
+    freely - that is how the operator sees it working - but it cannot cause
+    water to flow. The spray gate is in :class:`ActuationConfig`.
+
+    The envelope (``min_pan``/``max_pan``/``min_tilt``/``max_tilt``) is
+    enforced here, in software, and again in the firmware. It exists because a
+    turret breaks the assumption a fixed nozzle made safe: with a fixed
+    nozzle, fire being in the right place means the water is too. With a
+    turret it does not, so the mount is confined to a range narrower than the
+    mechanism's own travel.
+
+    ``aim_tolerance_degrees`` is the spray interlock. The valve will not open
+    unless the turret reports a position within this tolerance of the aim
+    target, so a stalled or mis-calibrated turret fails closed.
+    """
+
+    enable_turret: bool = Field(
+        default=False, description="Master switch. Off means no aiming hardware."
+    )
+    dry_run: bool = Field(
+        default=True, description="Simulate aiming; touch no hardware."
+    )
+    serial_port: str | None = Field(
+        default=None, description="Serial device for the turret controller, e.g. /dev/ttyUSB0."
+    )
+    baud_rate: int = Field(default=115200, gt=0)
+    serial_timeout_seconds: float = Field(default=2.0, gt=0)
+    startup_delay_seconds: float = Field(
+        default=2.0, ge=0, description="Wait for the controller to reboot after the port opens."
+    )
+
+    # Travel envelope, enforced in software and firmware.
+    min_pan: float = Field(default=-60.0)
+    max_pan: float = Field(default=60.0)
+    min_tilt: float = Field(default=-10.0)
+    max_tilt: float = Field(default=45.0)
+
+    # Datum the envelope is measured from.
+    home_pan: float = Field(default=0.0)
+    home_tilt: float = Field(default=0.0)
+
+    aim_tolerance_degrees: float = Field(
+        default=5.0,
+        gt=0,
+        description="Max angular error tolerated before a spray is refused.",
+    )
+    settle_seconds: float = Field(
+        default=0.4, ge=0, description="Wait after a move for the mount to stop ringing."
+    )
+    calibration_path: str = Field(
+        default="configs/turret_calibration.json",
+        description="Where the pixel->bearing calibration is read from.",
+    )
+
+    @model_validator(mode="after")
+    def _check_envelope(self) -> "TurretConfig":
+        if self.min_pan >= self.max_pan:
+            raise ValueError(
+                f"turret min_pan ({self.min_pan}) must be less than max_pan ({self.max_pan})"
+            )
+        if self.min_tilt >= self.max_tilt:
+            raise ValueError(
+                f"turret min_tilt ({self.min_tilt}) must be less than max_tilt ({self.max_tilt})"
+            )
+        for name, value in (
+            ("home_pan", self.home_pan),
+            ("home_tilt", self.home_tilt),
+        ):
+            low, high = (
+                (self.min_pan, self.max_pan)
+                if name == "home_pan"
+                else (self.min_tilt, self.max_tilt)
+            )
+            if not (low <= value <= high):
+                raise ValueError(
+                    f"{name}={value} lies outside the travel envelope "
+                    f"[{low}, {high}]. Homing must leave the mount inside the "
+                    "range it is allowed to move in."
+                )
+        if not self.dry_run and not self.serial_port:
+            raise ValueError(
+                "turret dry_run is false but serial_port is unset. Refusing to "
+                "start a live turret with no way to reach it."
+            )
+        return self
+
+
 class LoggingConfig(StrictModel):
     """Where detections, alerts and actuation events are persisted."""
 
@@ -256,6 +346,12 @@ class RuntimeConfig(StrictModel):
         default=None, gt=0, description="Cap processing rate; None = unlimited."
     )
     max_frames: int = Field(default=0, ge=0, description="0 = run until stopped.")
+    show_window: bool = Field(
+        default=False,
+        description="Open a live preview window. Requires a GUI build of OpenCV "
+        "(opencv-python, not opencv-python-headless) and a display.",
+    )
+    window_title: str = Field(default="firewatch")
 
 
 class AppConfig(StrictModel):
@@ -265,6 +361,7 @@ class AppConfig(StrictModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     alert: AlertConfig = Field(default_factory=AlertConfig)
     actuation: ActuationConfig = Field(default_factory=ActuationConfig)
+    turret: TurretConfig = Field(default_factory=TurretConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
 

@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 from .actuator import Actuator, ActuatorEvent, build_actuator
 from .config import ActuationConfig
@@ -69,6 +69,57 @@ class DenyReason(str, Enum):
     STALE_HEARTBEAT = "stale_heartbeat"
     IN_COOLDOWN = "in_cooldown"
     ALREADY_SPRAYING = "already_spraying"
+    AIM_UNAVAILABLE = "aim_unavailable"
+    AIM_OUTSIDE_ENVELOPE = "aim_outside_envelope"
+    AIM_NOT_SETTLED = "aim_not_settled"
+    TURRET_FAULT = "turret_fault"
+
+
+@dataclass(frozen=True)
+class AimOutcome:
+    """Whether the nozzle is actually pointing where the fire is.
+
+    Produced by the aiming layer each frame and consumed here as a gate. The
+    supervisor does not command the turret: it only refuses to spray when the
+    turret is not where it needs to be.
+
+    This gate exists because a turret breaks an assumption that made a fixed
+    nozzle safe. With a fixed nozzle, fire being in the right place means the
+    water is in the right place. Once the nozzle can move, that is no longer
+    true, so the achieved bearing has to be verified rather than assumed.
+    """
+
+    ok: bool
+    reason: str = ""
+    detail: str = ""
+    bearing: tuple[float, float] | None = None
+    error_degrees: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "reason": self.reason,
+            "detail": self.detail,
+            "bearing": (
+                [round(self.bearing[0], 2), round(self.bearing[1], 2)]
+                if self.bearing
+                else None
+            ),
+            "error_degrees": (
+                None if self.error_degrees is None else round(self.error_degrees, 2)
+            ),
+        }
+
+
+@runtime_checkable
+class AimGate(Protocol):
+    """Anything that can aim at a box and report whether it succeeded."""
+
+    def aim_at(
+        self,
+        bbox: tuple[float, float, float, float],
+        frame_size: tuple[int, int],
+    ) -> AimOutcome: ...
 
 
 @dataclass(frozen=True)
@@ -138,6 +189,7 @@ class ActuationSupervisor:
         actuator: Actuator | None = None,
         clock: Callable[[], float] = time.monotonic,
         zone_filter: ZoneFilter | None = None,
+        aim_gate: AimGate | None = None,
         on_decision: Callable[[ActuationDecision], None] | None = None,
         on_actuator_event: Callable[[ActuatorEvent], None] | None = None,
     ) -> None:
@@ -149,6 +201,7 @@ class ActuationSupervisor:
             if zone_filter is not None
             else ZoneFilter.from_configs(config.zones)
         )
+        self._aim_gate = aim_gate
         self._on_decision = on_decision
         self._on_actuator_event = on_actuator_event
 
@@ -251,7 +304,7 @@ class ActuationSupervisor:
             return timer_decision
 
         evidence = self._evaluate_evidence(result, frame_size)
-        return self._advance(evidence, now, frame_index=result.frame_index)
+        return self._advance(evidence, now, frame_index=result.frame_index, frame_size=frame_size)
 
     def tick(self) -> ActuationDecision | None:
         """Enforce timers without new frame data.
@@ -392,7 +445,11 @@ class ActuationSupervisor:
         return Evidence(present=False, deny_reason=strongest_deny)
 
     def _advance(
-        self, evidence: Evidence, now: float, frame_index: int
+        self,
+        evidence: Evidence,
+        now: float,
+        frame_index: int,
+        frame_size: tuple[int, int] | None = None,
     ) -> ActuationDecision:
         """Move the state machine given the current evidence."""
         if not evidence.present:
@@ -511,7 +568,67 @@ class ActuationSupervisor:
                 frame_index=frame_index,
             )
 
+        # The aim gate is the last check before water flows, and the one that
+        # a fixed nozzle never needed. Everything above proves the *fire* is
+        # real and in the right place; this proves the *nozzle* is pointed at
+        # it. With a movable mount those are independent facts.
+        aim_denial = self._check_aim(evidence, frame_size, frame_index)
+        if aim_denial is not None:
+            return aim_denial
+
         return self._start_spraying(evidence, now, frame_index=frame_index)
+
+    def _check_aim(
+        self,
+        evidence: Evidence,
+        frame_size: tuple[int, int] | None,
+        frame_index: int,
+    ) -> ActuationDecision | None:
+        """Verify the nozzle is on target. Returns a deny, or None to proceed.
+
+        When no aim gate is configured the turret is disabled, and the
+        behaviour is exactly as before this module existed. That keeps the
+        fixed-nozzle path unchanged.
+        """
+        if self._aim_gate is None:
+            return None
+
+        if evidence.bbox is None or frame_size is None:
+            # Aiming is impossible without knowing where the fire is. Refuse
+            # rather than spray on a bearing we cannot justify.
+            return self._decide(
+                action="none",
+                allowed=False,
+                reason=DenyReason.AIM_UNAVAILABLE.value,
+                detail="no aim target available; refusing to spray blind",
+                confidence=evidence.confidence,
+                frame_index=frame_index,
+            )
+
+        try:
+            outcome = self._aim_gate.aim_at(evidence.bbox, frame_size)
+        except Exception as exc:  # noqa: BLE001 - a broken turret must not spray
+            logger.exception("Aim gate raised")
+            return self._decide(
+                action="none",
+                allowed=False,
+                reason=DenyReason.TURRET_FAULT.value,
+                detail=f"aiming failed: {exc}",
+                confidence=evidence.confidence,
+                frame_index=frame_index,
+            )
+
+        if not outcome.ok:
+            reason = outcome.reason or DenyReason.AIM_NOT_SETTLED.value
+            return self._decide(
+                action="none",
+                allowed=False,
+                reason=reason,
+                detail=outcome.detail or "turret is not on target; refusing to spray",
+                confidence=evidence.confidence,
+                frame_index=frame_index,
+            )
+        return None
 
     # -- actuator commands -------------------------------------------------
 

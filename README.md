@@ -300,12 +300,135 @@ thresholds, it is to keep it in dry-run.
 
 ### What this does not do
 
-* It does not choose, size, aim or plumb the hardware.
+* It does not choose, size or plumb the hardware.
 * It does not detect fire *spread*, only where fire was seen in a frame.
 * It has no independent sensor. One model's opinion is the only evidence, which
   is why the constraints are conservative and `max_shots` defaults to 1.
 * It is not a substitute for a certified suppression system. A fire alarm and
   an extinguisher remain the primary controls.
+
+## Aiming (turret)
+
+An optional two-axis mount that points the nozzle at a detection. Aiming and
+spraying stay separate: **the turret can track a fire freely, but it cannot
+cause water to flow.** The mount following a fire is visible on the live
+preview long before any water is armed, which is what makes aiming testable
+without wetting anything.
+
+### Why aiming needs its own interlock
+
+A fixed nozzle had a useful property: if the fire was in the right place, the
+water was too. A movable mount loses that. The nozzle can now be pointed
+anywhere, so a fire in the right place no longer implies the water is, and a
+stalled, slipped or mis-calibrated turret would spray wherever it happens to
+be facing.
+
+Two rules close that gap:
+
+* **A software travel envelope.** The mount is confined to a range narrower
+  than its mechanism, enforced in Python *and* again in the firmware, so a
+  serial glitch or a host bug cannot drive it past its limits.
+* **Spray gated on the achieved bearing.** The valve opens only when the
+  turret *reports* a position within `aim_tolerance_degrees` of the target.
+  Unknown, stale or faulted position fails closed.
+
+Open-loop steppers are the reason for the second rule: a mount can be told to
+move, report success, and not be there.
+
+### Calibration
+
+The camera and nozzle share a rigid mount, so the pixel-to-bearing mapping is
+fixed and is measured once:
+
+```bash
+firewatch turret    --config configs/watergun.yaml   # show envelope and calibration
+firewatch calibrate --config configs/watergun.yaml   # guided, writes the mapping
+firewatch home      --config configs/watergun.yaml   # establish the datum
+```
+
+`calibrate` walks a grid of image points and asks for the pan/tilt that puts
+the nozzle on each. It prints the fitted map and the **residual at every
+point** - a large residual means the rig is not behaving linearly (a slipping
+coupling, a mis-scaled axis) and no extra points will fix it.
+
+The mapping is affine per axis in *normalised* coordinates, so changing camera
+resolution does not invalidate it. There is no parallax term because the rig is
+coaxial; a separated camera and nozzle would need one.
+
+### Live preview
+
+```yaml
+runtime:
+  show_window: true
+```
+
+Draws the fire box, the aim point in image space, the travel envelope, and a
+status block with the current state and aim error. Press `q` or `Esc` to stop.
+
+It needs a GUI build of OpenCV (`opencv-python`, **not** the headless build)
+and a display. Availability is checked *before* `cv2.imshow` is called,
+because on a headless machine that call aborts the process rather than raising
+an exception - so a preview misconfigured on a headless box would otherwise
+take down the detection loop. With no display the run continues without a
+window.
+
+### Hardware
+
+The turret talks to an ESP32 over USB serial. The sketch is in
+`firmware/esp32_turret/esp32_turret.ino` and speaks a line-oriented ASCII
+protocol:
+
+```
+HOME              -> OK HOME pan=<p> tilt=<t>
+GOTO <pan> <tilt> -> OK GOTO pan=<p> tilt=<t>
+POS               -> OK POS pan=<p> tilt=<t>
+JOG <axis> <deg>  -> OK JOG pan=<p> tilt=<t>      (manual, for calibration)
+WATER ON/OFF      -> OK WATER on|off
+STOP              -> OK STOP
+```
+
+Any rejection answers `ERR <reason>`, which the host treats as a fault - that
+is what stops a spray when the mount cannot do what it was asked. The firmware
+also cuts the water if the host stops talking for 5 seconds, covering a
+crashed host or a pulled cable.
+
+```yaml
+turret:
+  enable_turret: true
+  dry_run: true                 # keep true until aiming is verified on screen
+  serial_port: /dev/ttyUSB0     # Windows: COM3
+  min_pan: -60.0
+  max_pan: 60.0
+  min_tilt: -10.0
+  max_tilt: 45.0
+  aim_tolerance_degrees: 5.0
+  calibration_path: configs/turret_calibration.json
+```
+
+### Bringing a rig up
+
+Do these in order. Each step adds exactly one physical capability:
+
+1. **Everything dry-run, no water connected.** Watch the mount track fire on
+   the preview. This is the step that proves calibration and the envelope.
+2. **Turret live, actuation still dry-run.** The mount really moves; no water.
+3. **Both live, pump disconnected from the nozzle.** Confirm relay timing and
+   that the valve closes when it should.
+4. **Both live, water connected.** Short bursts, someone present, extinguisher
+   to hand.
+
+`logs/actuation.jsonl` records every decision and every actuator event. If
+there is a single entry there you would not have wanted to become real water,
+the answer is not to tune the thresholds - it is to go back a step.
+
+### What the aiming layer does not do
+
+* It does not correct for parallax (the rig is assumed coaxial).
+* It does not use the camera to verify that water reached the fire. The
+  inline flow sensor is the only proof water moved, and nothing reads it yet.
+* It does not sweep. It aims at the centre of the fire box and holds.
+* It does not compensate for recoil or hose pull, which will move a light
+  mount once water starts flowing.
 
 ## Tests
 
@@ -333,21 +456,32 @@ firewatch/
   geometry.py        # protected zones: point-in-polygon and bbox coverage
   actuator.py        # hardware boundary: dry-run and subprocess actuators
   supervisor.py      # actuation state machine and safety interlocks
+  turret.py          # aiming hardware: dry-run and serial turrets
+  aiming.py          # pixel -> bearing calibration and the aim solver
+  aim_controller.py  # drives the turret and verifies the achieved aim
+  liveview.py        # live preview overlay (optional, needs a display)
   logging_utils.py   # JSONL detection/alert/actuation writers
   visualize.py       # annotated frame rendering
   pipeline.py        # orchestration; run_forever() entry point
-  cli.py             # argparse CLI (run / analyze / check)
+  cli.py             # argparse CLI (run / analyze / check / home / calibrate / turret)
+firmware/esp32_turret/     # Arduino sketch: steppers, homing, pump relay
 tests/               # pytest suite; fakes live in conftest.py
 configs/default.yaml       # default configuration
 configs/zones.example.yaml # worked example of protected zones
+configs/watergun.yaml      # worked example of a turret rig
 scripts/download_model.py
 ```
 
-The detection path and the actuation path are deliberately separate modules.
-`detector.py` never knows a valve exists, and `supervisor.py` never knows how a
-frame was produced. That boundary is what lets the safety logic be tested with
-no camera and no hardware, and it keeps the code that can move water small
-enough to review in full.
+The detection path, the aiming path and the spray path are deliberately
+separate modules. `detector.py` never knows a valve or a turret exists;
+`supervisor.py` never knows how a frame was produced; `turret.py` never knows
+what a detection is. Those boundaries are what let the safety logic be tested
+with no camera and no hardware, and they keep the code that can move water
+small enough to review in full.
+
+The aiming and spray paths meet in exactly one place - the aim gate the
+supervisor consults immediately before opening the valve. Everything else
+about aiming is free to run without any bearing on whether water flows.
 
 ## Performance
 

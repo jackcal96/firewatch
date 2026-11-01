@@ -24,6 +24,16 @@ dev = [
     "pytest-cov>=5.0",
     "openhands-sdk>=1.0",
 ]
+# Needed only to drive a real turret over serial. The dry-run turret and the
+# whole test suite work without it, so it stays optional.
+turret = [
+    "pyserial>=3.5",
+]
+# A GUI build of OpenCV is required for the live preview window. The default
+# headless build cannot open one.
+display = [
+    "opencv-python>=4.9",
+]
 
 [project.scripts]
 firewatch = "firewatch.cli:main"
